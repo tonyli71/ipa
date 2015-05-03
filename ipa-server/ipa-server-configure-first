@@ -1,0 +1,243 @@
+#!/bin/bash
+
+# Copyright 2014 Jan Pazdziora
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+
+export LC_ALL=C
+
+function usage () {
+	if [ -n "$1" ] ; then
+		echo $1 >&2
+	else
+		echo "Start as docker run -h \$FQDN_HOSTNAME -e PASSWORD=\$THE_ADMIN_PASSWORD -v /path:/data:Z:rw image" >&2
+	fi
+	exit 1
+}
+
+function stop_running () {
+	systemctl stop-running
+	exit
+}
+trap exit TERM
+trap stop_running EXIT
+
+function update_server_ip_address () {
+	kdestroy -A
+	kinit -k
+	(
+		echo "server 127.0.0.1"
+		echo "update delete $HOSTNAME_FQDN A"
+		MY_IP=${IPA_SERVER_IP:-$( /sbin/ip addr show | awk '/inet .*global/ { split($2,a,"/"); print a[1]; }' | head -1 )}
+		echo "update add $HOSTNAME_FQDN 180 A $MY_IP"
+		echo "send"
+		echo "quit"
+	) | nsupdate -g
+	kdestroy -A
+}
+
+function upgrade_server () {
+	/usr/sbin/setup-ds.pl -u -s General.UpdateMode=offline
+	for i in 389-ds-base pki-server ; do
+		rpm -q --scripts $i | perl -lne '/^\S+ scriptlet/ and $x = 0; print if $x; if (/^postinstall scriptlet \(using (\S+)\)/) { $x = 1; print "#!$1"; if ($1 eq "/bin/sh") { print "set -x" } }' > /tmp/$i.script
+		if [ -s "/tmp/$i.script" ] ; then
+			chmod a+x /tmp/$i.script
+			/tmp/$i.script 2
+		fi
+	done
+	ipa-ldap-updater -u -q -y /data/ds-master-password
+	systemctl start certmonger.service
+	ipa-upgradeconfig
+	for c in /etc/systemctl-lite-enabled/*-domainname.service ; do
+		base_c=$(basename $c)
+		for i in /usr/lib/systemd/system/*-domainname.service ; do
+			base_i=$(basename $i)
+			if [ -e "$c" ] && [ -e "$i" ] && [ "$base_c" != "$base_i" ] ; then
+				echo "Renaming $c to $base_i"
+				mv $c "$(dirname $c)/$base_i"
+			fi
+		done
+	done
+	mv /data/build-id /data/build-id-upgraded-$( date +'%Y%m%d-%H%M%S' )
+	cp -f /data-template/build-id /data/build-id
+}
+
+if ! [ -f /etc/ipa/ca.crt ] ; then
+	( cd /data-template && tar cf - . ) | ( cd /data && tar xf - )
+fi
+systemd-tmpfiles --remove --create 2>&1 | grep -v 'Failed to replace specifiers' || :
+
+rm -f /var/run/*.pid /run/systemctl-lite-running/*
+
+CAN_EDIT_RESOLV_CONF=0
+cp -f /etc/resolv.conf /etc/resolv.conf.docker
+if echo '# test access' >> /etc/resolv.conf || umount /etc/resolv.conf 2> /dev/null ; then
+	CAN_EDIT_RESOLV_CONF=1
+	cp -f /etc/resolv.conf.docker /etc/resolv.conf
+fi
+
+if [ -f /etc/ipa/ca.crt ] ; then
+	if ! diff /data/volume-version /etc/volume-version ; then
+		echo "The /data volume was created using incompatible image."
+		exit 2
+	fi
+	if [ "$CAN_EDIT_RESOLV_CONF" == "1" ] ; then
+		if [ -f /data/etc/resolv.conf.ipa ] ; then
+			perl -pe 's/^(nameserver).*/$1 127.0.0.1/' /data/etc/resolv.conf.ipa > /etc/resolv.conf
+		fi
+	fi
+	# Removing kdcinfo.* which is likely to hold old IP address
+	rm -rf /var/lib/sss/pubconf/kdcinfo.*
+	if diff -q /data/build-id /data-template/build-id ; then
+		echo "IPA server is already configured, starting the services."
+	else
+		echo "IPA server is already configured but with different version, starting upgrade."
+		for d in /usr/share/java/resteasy* ; do
+			sed -i 's#^\(JAVA_OPTS=".*-DRESTEASY_LIB=\)/usr/share/java/resteasy[a-z-]*\(.*"\)#\1'$d'\2#' /etc/sysconfig/pki-tomcat
+		done
+		( cd /data-template && find * | while read f ; do if ! [ -e /data/$f ] ; then tar cf - $f | ( cd /data && tar xf - ) ; fi ; done )
+		cat /etc/volume-data-list | while read i ; do
+			if [ -e /data-template$i -a -e /data$i ] ; then
+				chown --reference=/data-template$i /data$i
+				chmod --reference=/data-template$i /data$i
+			fi
+		done
+		upgrade_server
+	fi
+	systemctl start-enabled
+	HOSTNAME_FQDN=$( hostname -f )
+	while ! host $HOSTNAME_FQDN > /dev/null ; do
+		sleep 5
+	done
+	update_server_ip_address
+	while ! host $HOSTNAME_FQDN > /dev/null ; do
+		sleep 5
+	done
+	host $HOSTNAME_FQDN
+	echo "IPA server started."
+else
+	REPLICA=false
+	if [ -f /data/ipa-replica-install-options ] ; then
+		if [ -f /data/ipa-server-install-options ] ; then
+			usage "Too many install options files."
+		fi
+		REPLICA=true
+		if [ $(ls /data/ | grep  \\.gpg$ | wc -l) -gt 1 ] ; then
+			usage "Too many .gpg files"
+		fi
+		if [ ! -f /data/*.gpg ] ; then
+			usage "Cannot create an IPA replica without .gpg file"
+		fi
+		RUN_CMD="/usr/sbin/ipa-replica-install /data/*.gpg"
+	else
+		if [ ! -f /data/ipa-server-install-options ] && [ -z "$PASSWORD" ] ; then
+			usage
+		fi
+		RUN_CMD="/usr/sbin/ipa-server-install"
+	fi
+
+	(
+		cd /data
+		grep '/$' /etc/volume-data-list | sed 's!^!.!' | xargs mkdir -p
+		grep -v '/$' /etc/volume-data-list | xargs dirname | sed 's!^!.!' | xargs mkdir -p
+		grep -v '/$' /etc/volume-data-list | sed 's!^!.!' | xargs touch
+	)
+	xargs rm -f < /etc/volume-data-mv-list
+
+	HOSTNAME_FQDN=$( hostname -f )
+	HOSTNAME_SHORT=${HOSTNAME_FQDN%%.*}
+	DOMAIN=${HOSTNAME_FQDN#*.}
+	if [ "$HOSTNAME_SHORT.$DOMAIN" != "$HOSTNAME_FQDN" ] ; then
+		usage
+	fi
+
+	REALM=${DOMAIN^^}
+
+	if [ -z "$FORWARDER" ] ; then
+		FORWARDER=$( awk '$1 == "nameserver" { print $2; exit }' /etc/resolv.conf )
+	fi
+	if [ "$FORWARDER" == '127.0.0.1' ] ; then
+		FORWARDER=--no-forwarders
+	else
+		FORWARDER=--forwarder=$FORWARDER
+	fi
+
+	if [ "$CAN_EDIT_RESOLV_CONF" == "0" ] ; then
+		find /usr -name bindinstance.py | xargs sed -i '/changing resolv.conf to point to ourselves/s/^/#/'
+	fi
+
+	touch /data/ds-master-password
+	chmod 600 /data/ds-master-password
+	if ( if [ -n "$PASSWORD" ] ; then
+			if $REPLICA ; then
+				echo "--password=$PASSWORD"
+			else
+				echo "--ds-password=$PASSWORD"
+			fi
+			echo "--admin-password=$PASSWORD"
+			echo "$PASSWORD" > /data/ds-master-password
+		fi
+		if [ -n "$DEBUG" ] ; then
+			echo "--debug"
+		fi
+		if $REPLICA ; then
+			cat /data/ipa-replica-install-options
+			echo "--skip-conncheck"
+			if grep -q '^--password=' /data/ipa-replica-install-options ; then
+				grep '^--password=' /data/ipa-replica-install-options | xargs echo -- | sed 's/^-- --password=//' > /data/ds-master-password
+			fi
+		else
+			if [ -f /data/ipa-server-install-options ] ; then
+				cat /data/ipa-server-install-options
+				if grep -q '^--ds-password=' /data/ipa-server-install-options ; then
+					grep '^--ds-password=' /data/ipa-server-install-options | xargs echo -- | sed 's/^-- --ds-password=//' > /data/ds-master-password
+				fi
+			fi
+			echo "-r $REALM"
+		fi
+		echo "--setup-dns $FORWARDER"
+		) | xargs $RUN_CMD -U $IPA_SERVER_INSTALL_OPTS ; then
+		sed -i 's/default_ccache_name/# default_ccache_name/' /data/etc/krb5.conf
+		cp -f /etc/resolv.conf /data/etc/resolv.conf.ipa
+		cat /etc/volume-data-mv-list | while read i ; do
+			rm -rf /data$i
+			if [ -e $i ] ; then
+				mv $i /data$i
+				ln -sf /data$i $i
+			fi
+		done
+		cp /etc/volume-version /data/volume-version
+		update_server_ip_address
+		echo "IPA server configured."
+	else
+		ret=$?
+		echo "IPA server configuration failed."
+		exit $ret
+	fi
+fi
+
+#netstat -lnp | grep 123
+/usr/sbin/ntpd
+
+if [ -t 0 ] ; then
+	echo 'Starting interactive shell.'
+        export LC_ALL=C
+	/bin/bash
+else
+	echo 'Go loop.'
+	while true ; do sleep 1000 & wait $! ; done
+fi
+
+

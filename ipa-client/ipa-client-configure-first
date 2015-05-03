@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Copyright 2015 Tony Li
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+
+export LC_ALL=C
+
+function usage () {
+	if [ -n "$1" ] ; then
+		echo $1 >&2
+	else
+		echo "Start as docker run  --link ipa-server-container:ipa -e IPA_SERVER_IP=<192.168.0.250> -e IPA_SERVER=<ipa.tli.redhat.com> -h \$FQDN_HOSTNAME -e PASSWORD=\$THE_ADMIN_PASSWORD  -ti <ipa-client> --cap_add SYS_TIME " >&2
+	fi
+	exit 1
+}
+
+function stop_running () {
+	systemctl stop-running
+	exit
+}
+
+trap exit TERM
+trap stop_running EXIT
+
+function update_server_ip_address () {
+	kdestroy -A
+	kinit -k
+	(
+		echo "server 127.0.0.1"
+		echo "update delete $HOSTNAME_FQDN A"
+		MY_IP=${IPA_SERVER_IP:-$( /sbin/ip addr show | awk '/inet .*global/ { split($2,a,"/"); print a[1]; }' | head -1 )}
+		echo "update add $HOSTNAME_FQDN 180 A $MY_IP"
+		echo "send"
+		echo "quit"
+	) | nsupdate -g
+	kdestroy -A
+}
+
+if ! [ -f /etc/ipa/ca.crt ] ; then
+        echo "Init Data ..."
+        ( cd /data-template && tar cf - . ) | ( cd /data && tar xf - )
+fi
+
+systemd-tmpfiles --remove --create 2>&1 | grep -v 'Failed to replace specifiers' || :
+
+rm -f /var/run/*.pid /run/systemctl-lite-running/*
+
+CAN_EDIT_RESOLV_CONF=0
+cp -f /etc/resolv.conf /etc/resolv.conf.docker
+if echo '# test access' >> /etc/resolv.conf || umount /etc/resolv.conf 2> /dev/null ; then
+	CAN_EDIT_RESOLV_CONF=1
+	cp -f /etc/resolv.conf.docker /etc/resolv.conf
+fi
+
+if [ -f /etc/ipa/ca.crt ] ; then
+        if ! diff /data/volume-version /etc/volume-version ; then
+                echo "The /data volume was created using incompatible image."
+                exit 2
+        fi
+        if [ "$CAN_EDIT_RESOLV_CONF" == "1" ] ; then
+                if [ -f /data/etc/resolv.conf.ipa ] ; then
+                        perl -pe 's/^(nameserver).*/$1 127.0.0.1/' /data/etc/resolv.conf.ipa > /etc/resolv.conf
+                fi
+        fi
+        # Removing kdcinfo.* which is likely to hold old IP address
+        rm -rf /var/lib/sss/pubconf/kdcinfo.*
+
+        systemctl start-enabled
+        HOSTNAME_FQDN=$( hostname -f )
+        while ! host $HOSTNAME_FQDN > /dev/null ; do
+                sleep 5
+        done
+        update_server_ip_address
+        while ! host $HOSTNAME_FQDN > /dev/null ; do
+                sleep 5
+        done
+        host $HOSTNAME_FQDN
+        echo "IPA server started."
+else
+        RUN_CMD="/usr/sbin/ipa-client-install"
+        (
+                cd /data
+                grep '/$' /etc/volume-data-list | sed 's!^!.!' | xargs mkdir -p
+                grep -v '/$' /etc/volume-data-list | xargs dirname | sed 's!^!.!' | xargs mkdir -p
+                grep -v '/$' /etc/volume-data-list | sed 's!^!.!' | xargs touch
+        )
+
+        xargs rm -f < /etc/volume-data-mv-list
+
+        HOSTNAME_FQDN=$( hostname -f )
+        HOSTNAME_SHORT=${HOSTNAME_FQDN%%.*}
+        DOMAIN=${HOSTNAME_FQDN#*.}
+        if [ "$HOSTNAME_SHORT.$DOMAIN" != "$HOSTNAME_FQDN" ] ; then
+                usage
+        fi
+
+        echo "search $DOMAIN" > /etc/resolv.conf 
+        echo "nameserver $IPA_SERVER_IP" > /etc/resolv.conf 
+
+        # Removing kdcinfo.* which is likely to hold old IP address
+        rm -rf /var/lib/sss/pubconf/kdcinfo.*
+
+        sed -i 's/default_ccache_name/# default_ccache_name/' /data/etc/krb5.conf
+
+        REALM=${DOMAIN^^}
+
+        echo "$RUN_CMD -U $IPA_SERVER_INSTALL_OPTS --domain=$DOMAIN --enable-dns-updates -w $PASSWORD --realm=$REALM --server=$IPA_SERVER --unattended --no-ntp --force-join -p admin"
+
+        systemctl start-enabled
+
+        HOSTNAME_FQDN=$IPA_SERVER
+        while ! host $HOSTNAME_FQDN > /dev/null ; do
+                sleep 5
+        done
+
+        $RUN_CMD -U $IPA_SERVER_INSTALL_OPTS --domain=$DOMAIN --enable-dns-updates -w $PASSWORD --realm=$REALM --server=$IPA_SERVER --unattended --no-ntp --force-join -p admin &
+
+fi
+
+echo 'Starting interactive shell.'
+export LC_ALL=C
+/bin/bash
+
