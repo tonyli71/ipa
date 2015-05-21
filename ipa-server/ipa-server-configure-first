@@ -16,6 +16,56 @@
 
 set -e
 
+if [ "$ADEBUG" != "" ] ; then
+    if [ "$ADEBUG" == "1" ] ; then
+       set -x
+    else
+       /bin/bash
+    fi
+fi
+
+if [ "$HOSTNAME" != "" ] ; then
+    hostname $HOSTNAME
+fi
+
+if [ "$ETH0_IP" != "" ] ; then
+
+    echo "OLD network info :"
+    ifconfig
+
+    HOSTNAME_FQDN=$(hostname)
+    echo "HOSTNAME_FQDN=$HOSTNAME_FQDN"
+    OLD_IP=`cat /etc/hosts | grep $HOSTNAME_FQDN | awk -F ' ' '{ print $1;}'`
+    echo "HOSTNAME_OLD_IP=$OLD_IP"
+    
+    echo "OLD route info :"
+    route -n
+
+    if [ "$ETH0_NETMASK" != "" ] ; then
+        ifconfig eth0 $ETH0_IP netmask $ETH0_NETMASK
+    else
+        ifconfig eth0 $ETH0_IP netmask 255.255.255.0
+    fi
+    
+    if [ "$OLD_IP" != "" ] ; then
+       cp /etc/hosts /tmp/hosts.docker
+       cat /tmp/hosts.docker | sed  "s/$OLD_IP/$ETH0_IP/g" > /etc/hosts
+    fi
+
+    echo "NEW network info :"
+    ifconfig
+
+    echo "NEW network route info :"
+    route -n
+
+    if [ "$ETH0_GW" != "" ] ; then
+        #route del default || true
+        route add default gw $ETH0_GW
+        echo "NEW route info :"
+        route -n
+    fi
+fi
+
 export LC_ALL=C
 
 function usage () {
@@ -26,6 +76,8 @@ function usage () {
 	fi
 	exit 1
 }
+
+
 
 function stop_running () {
 	systemctl stop-running
@@ -117,7 +169,7 @@ if [ -f /etc/ipa/ca.crt ] ; then
 		upgrade_server
 	fi
 	systemctl start-enabled
-	HOSTNAME_FQDN=$( hostname -f )
+	HOSTNAME_FQDN=$(hostname)
 	while ! host $HOSTNAME_FQDN > /dev/null ; do
 		sleep 5
 	done
@@ -156,7 +208,7 @@ else
 	)
 	xargs rm -f < /etc/volume-data-mv-list
 
-	HOSTNAME_FQDN=$( hostname -f )
+	HOSTNAME_FQDN=$(hostname)
 	HOSTNAME_SHORT=${HOSTNAME_FQDN%%.*}
 	DOMAIN=${HOSTNAME_FQDN#*.}
 	if [ "$HOSTNAME_SHORT.$DOMAIN" != "$HOSTNAME_FQDN" ] ; then
@@ -228,8 +280,13 @@ else
 	fi
 fi
 
-#netstat -lnp | grep 123
-/usr/sbin/ntpd
+if [ "$(netstat -lnp | grep 123 | grep ntpd)" == "" ] ; then
+   /usr/sbin/ntpd
+fi
+
+if [ "$(netstat -lnp | grep 22 | grep sshd)" == "" ] ; then
+   systemctl start sshd.service
+fi
 
 if [ -t 0 ] ; then
 	echo 'Starting interactive shell.'

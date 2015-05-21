@@ -1,18 +1,18 @@
 [lrhel-7-server-rpms]
 name=lrhel-7-server-rpms
-baseurl=http://192.168.0.250:81/repos/rhel-7-server-rpms/
+baseurl=http://10.128.0.200:81/repos/rhel-7-server-rpms/
 gpgcheck=0
 enabled=1
 
 [lrhel-7-server-openstack-6.0-rpms]
 name=lrhel-7-server-openstack-6.0-rpms
-baseurl=http://192.168.0.250:81/repos/rhel-7-server-openstack-6.0-rpms/
+baseurl=http://10.128.0.200:81/repos/rhel-7-server-openstack-6.0-rpms/
 gpgcheck=0
 enabled=1
 
 [lrhel-7-server-openstack-6.0-installer-rpms]
 name=lrhel-7-server-openstack-6.0-installer-rpms
-baseurl=http://192.168.0.250:81/repos/rhel-7-server-openstack-6.0-installer-rpms/
+baseurl=http://10.128.0.200:81/repos/rhel-7-server-openstack-6.0-installer-rpms/
 gpgcheck=0
 enabled=1
 

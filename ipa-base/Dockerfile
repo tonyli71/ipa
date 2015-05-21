@@ -2,7 +2,8 @@
 # Version 1
 # Clone from the rhel7 image
 
-FROM rhel7:latest
+#FROM rhel7:latest
+FROM rhel7/rhel-tools:latest
 
 USER root
 
@@ -87,6 +88,8 @@ RUN yum --disablerepo=* --enablerepo=lrhel* install -y  python-memcached python-
 #RUN yum --disablerepo=* --enablerepo=lrhel* install -y  redhat-access-plugin-ipa redhat-logos 
 
 RUN yum --disablerepo=* --enablerepo=lrhel* install -y ipa-server  
+
+RUN yum --disablerepo=* --enablerepo=lrhel* install -y openssh-server  
 
 RUN yum-config-manager --disable *-eus-* *-htb-* *-ha-* *-rt-* *-lb-* *-rs-* *-sap-* > /dev/null
 
