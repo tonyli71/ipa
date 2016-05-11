@@ -46,3 +46,6 @@ ipa dnsrecord-del rhos.tli.redhat.com foreman --a-rec 192.168.0.218
 #### option 3:
 
 use browser access and use your ipa-server
+
+### How to build the ipa-server image
+please change the local.repo file and point to correct yum local repo . :)
